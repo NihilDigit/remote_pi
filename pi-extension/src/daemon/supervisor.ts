@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { addDaemon, listDaemons, migrateRegistryNames, removeDaemon } from "./registry.js";
 import { daemonIdForCwd } from "./id.js";
 import { defaultAgentName, type LocalConfig } from "../session/local_config.js";
@@ -29,6 +30,7 @@ import {
   type NewJobInput,
 } from "./cron_registry.js";
 import { appendCronLog, readCronLog, type CronResult } from "./cron_log.js";
+import { HostService, type HostServiceOptions } from "./host-service.js";
 
 /**
  * Central process that owns the daemon fleet (plan/26).
@@ -60,7 +62,10 @@ const RESTART_BACKOFFS_MS = [1_000, 5_000, 30_000, 5 * 60_000];
 function supervisorSockPath(): string {
   const root = process.env["REMOTE_PI_HOME"] || homedir();
   // POSIX → ~/.pi/remote/supervisor.sock; Windows → per-user named pipe (plan/40).
-  return ipcAddress("supervisor", join(root, ".pi", "remote", SUPERVISOR_SOCK_NAME));
+  const suffix = process.env["REMOTE_PI_HOME"]
+    ? `supervisor-${createHash("sha256").update(root).digest("hex").slice(0, 16)}`
+    : "supervisor";
+  return ipcAddress(suffix, join(root, ".pi", "remote", SUPERVISOR_SOCK_NAME));
 }
 
 /** Thrown by `start()` when another live supervisor already holds the UDS.
@@ -100,6 +105,11 @@ export interface SupervisorOptions {
   extensionPath: string;
   /** Override the `pi` binary path. Defaults to "pi" on PATH. */
   piBin?: string;
+  autoStart?: boolean;
+  host?: Pick<HostServiceOptions, "hostId" | "name" | "projects" | "recordsPath">;
+  trustProject?: boolean;
+  loadExtension?: boolean;
+  childEnv?: NodeJS.ProcessEnv;
 }
 
 /** Pure decision for `fireJob` (plan/39) — picks the action from the daemon's
@@ -130,6 +140,7 @@ export class Supervisor {
   /** Live croner schedules, keyed by cron job id (plan/39). */
   private readonly cronJobs = new Map<string, Cron>();
   private shuttingDown = false;
+  host: HostService | undefined;
 
   constructor(private readonly opts: SupervisorOptions) {}
 
@@ -140,7 +151,23 @@ export class Supervisor {
     // field) so every daemon has a stable name to inject via env.
     migrateRegistryNames();
     await this._bindUds();
-    this._spawnAllFromRegistry();
+    if (this.opts.host) {
+      this.host = new HostService({
+        ...this.opts.host,
+        startChild: (id, options) => {
+          const child = new RpcChild({
+            ...options, extensionPath: this.opts.extensionPath, piBin: this.opts.piBin,
+            trustProject: this.opts.trustProject, loadExtension: this.opts.loadExtension,
+            env: this.opts.childEnv,
+          });
+          this.children.set(id, { id, cwd: options.cwd, child, restartTimer: null, restartAttempt: 0 });
+          return child;
+        },
+        hasOtherWriter: (cwd) => listDaemons().some((entry) =>
+          entry.cwd === cwd && ["running", "starting"].includes(this.children.get(entry.id)?.child.state ?? "stopped")),
+      });
+    }
+    if (this.opts.autoStart !== false) this._spawnAllFromRegistry();
     // Cron (plan/39): schedule all enabled jobs, then run any missed catchup.
     this._reconcileCron();
     this._runCatchup();
@@ -149,6 +176,7 @@ export class Supervisor {
   /** Graceful shutdown: stop all children, close UDS. */
   async stop(): Promise<void> {
     this.shuttingDown = true;
+    await this.host?.close();
     // Stop all cron schedules (plan/39) so no fire races with teardown.
     for (const c of this.cronJobs.values()) c.stop();
     this.cronJobs.clear();

@@ -1,5 +1,6 @@
 import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { DaemonState } from "./control_protocol.js";
@@ -43,6 +44,9 @@ export interface RpcChildOptions {
    * when omitted.
    */
   config?: LocalConfig;
+  session?: { kind: "new"; id: string } | { kind: "history"; file: string };
+  trustProject?: boolean;
+  loadExtension?: boolean;
 }
 
 export interface RpcChildExitEvent {
@@ -112,6 +116,7 @@ export function resolvePiSpawn(
   nodeExe: string = process.execPath,
 ): PiSpawnTarget {
   const resolved = resolvePiBin(piBin, plat);
+  if (/\.[cm]?js$/i.test(resolved)) return { command: nodeExe, prefixArgs: [resolved] };
   if (plat !== "win32") return { command: resolved, prefixArgs: [] };
   if (/\.(cmd|bat)$/i.test(resolved)) {
     const target = _npmShimTarget(resolved);
@@ -230,6 +235,11 @@ export class RpcChild extends EventEmitter {
   private _busy = false;
   /** In-flight `get_state` requests, keyed by request id. */
   private readonly _statePending = new Map<string, { resolve: (b: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly requests = new Map<string, {
+    resolve: (data: unknown) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   constructor(private readonly opts: RpcChildOptions) {
     super();
@@ -265,7 +275,13 @@ export class RpcChild extends EventEmitter {
     this.forceFreshSessionOnNextSpawn = false;
     // On Windows `prefixArgs` carries pi's cli.js (we spawn node directly); on
     // POSIX it's empty and `command` is `pi` itself.
-    const args = [...piTarget.prefixArgs, ...rpcSpawnArgs(this.opts.extensionPath, sessionName, useContinue)];
+    const session = this.opts.session;
+    const args = session ? [
+      ...piTarget.prefixArgs, "--mode", "rpc",
+      ...(this.opts.trustProject ? ["--approve"] : []),
+      ...(session.kind === "new" ? ["--session-id", session.id] : ["--session", session.file]),
+      ...(this.opts.loadExtension === false ? [] : ["-e", this.opts.extensionPath]),
+    ] : [...piTarget.prefixArgs, ...rpcSpawnArgs(this.opts.extensionPath, sessionName, useContinue)];
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...this.opts.env,
@@ -287,10 +303,13 @@ export class RpcChild extends EventEmitter {
       windowsHide: process.platform === "win32",
     });
     this.child = child;
+    child.stdin?.on("error", (error: Error) => this.rejectRequests(error));
+    child.stdin?.on("error", (error: Error) => this.rejectRequests(error));
     this._startedAt = Date.now();
     this._state = "running";
 
-    child.stdout?.on("data", (chunk: Buffer) => this._onStdout(chunk));
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => this._onStdout(chunk));
     child.stderr?.on("data", (chunk: Buffer) => {
       // Forward stderr to our own stderr so `journalctl --user -u remote-pi-supervisord`
       // sees daemon logs (with cwd prefix for disambiguation).
@@ -300,6 +319,8 @@ export class RpcChild extends EventEmitter {
     child.on("error", (err) => {
       // spawn() itself failed (e.g. `pi` binary not found).
       this._state = "crashed";
+      this.child = null;
+      this.rejectRequests(new Error("Pi process failed to start"));
       process.stderr.write(
         `[remote-pi-supervisord] spawn failed for ${this.opts.cwd}: ${String(err)}\n`,
       );
@@ -348,7 +369,7 @@ export class RpcChild extends EventEmitter {
     });
   }
 
-  private _onStdout(chunk: Buffer): void {
+  private _onStdout(chunk: string): void {
     this.stdoutBuf += chunk.toString();
     let nl: number;
     while ((nl = this.stdoutBuf.indexOf("\n")) >= 0) {
@@ -360,6 +381,18 @@ export class RpcChild extends EventEmitter {
   }
 
   private _handleStdoutLine(line: string): void {
+    try {
+      const response = JSON.parse(line) as { type?: string; id?: string; success?: boolean; data?: unknown; error?: string };
+      if (response.type === "response" && response.id) {
+        const pending = this.requests.get(response.id);
+        if (pending) {
+          this.requests.delete(response.id);
+          clearTimeout(pending.timer);
+          if (response.success === true) pending.resolve(response.data);
+          else pending.reject(new Error(response.error ?? "Pi RPC command failed"));
+        }
+      }
+    } catch { /* Extension diagnostics are not RPC responses. */ }
     const t = busyTransition(line);
     if (t !== null) this._busy = t;
     const gs = parseGetStateResponse(line);
@@ -373,6 +406,38 @@ export class RpcChild extends EventEmitter {
       }
     }
     this.emit("stdout", line);
+  }
+
+  request(type: string, fields: Record<string, unknown> = {}, timeoutMs = 15000): Promise<unknown> {
+    const id = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.requests.delete(id);
+        reject(new Error(`Pi RPC ${type} timed out`));
+      }, timeoutMs);
+      this.requests.set(id, { resolve, reject, timer });
+      try { this.write({ ...fields, id, type }); }
+      catch (error) {
+        clearTimeout(timer);
+        this.requests.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  write(command: object): void {
+    if (!this.child?.stdin || this.child.stdin.destroyed || this._state !== "running") {
+      throw new Error("Pi runtime is offline");
+    }
+    this.child.stdin.write(JSON.stringify(command) + "\n");
+  }
+
+  private rejectRequests(error: Error): void {
+    for (const pending of this.requests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.requests.clear();
   }
 
   /**
@@ -417,6 +482,7 @@ export class RpcChild extends EventEmitter {
     this.child = null;
     this._startedAt = null;
     this._busy = false;
+    this.rejectRequests(new Error("Pi runtime exited"));
     for (const p of this._statePending.values()) {
       clearTimeout(p.timer);
       p.resolve(false);

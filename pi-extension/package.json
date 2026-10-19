@@ -13,7 +13,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
-    "test": "vitest run",
+    "test": "vitest run && tsx --test src/daemon/host-session-control.test.ts src/daemon/host-events.test.ts src/daemon/host-approvals.test.ts src/daemon/session-catalog.test.ts",
     "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
   },
   "keywords": [
@@ -59,15 +59,8 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@google/genai",
-      "esbuild",
-      "koffi",
-      "protobufjs"
-    ]
-  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.1.0",
     "@types/node": "^25.8.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.22.0",
@@ -76,8 +69,8 @@
     "vitest": "^4.1.6"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.10",
-    "@earendil-works/pi-tui": "^0.79.10",
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-tui": "^1.1.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/keyring": "^1.3.0",
     "@noble/ed25519": "^3.1.0",

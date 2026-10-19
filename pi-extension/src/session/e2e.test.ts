@@ -766,9 +766,12 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
     const broker = orq.localBroker()!;
     const capture = capturingRemoteRouter();
     const handlerMessages: Envelope[] = [];
+    let delivered = () => {};
+    const allDelivered = new Promise<void>((resolve) => { delivered = resolve; });
     orq.onMessage((env) => {
       if ((env.body as { type?: string } | null)?.type === "transport_error") {
         handlerMessages.push(env);
+        if (handlerMessages.length === 2) delivered();
       }
     });
     broker.setRemoteRouter(capture.router);
@@ -799,6 +802,7 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
       })).toBe("received");
       await flushUds();
 
+      await allDelivered;
       expect(handlerMessages).toEqual(expect.arrayContaining([
         expect.objectContaining({ from: sibling.address(), re: ackOutbound.id }),
         expect.objectContaining({ from: "casa:broker", re: requestOutbound.id }),

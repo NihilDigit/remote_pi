@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import { mkdir, readFile, writeFile, chmod, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, chmod, unlink, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { generateEd25519Keypair, type Ed25519Keypair } from "./crypto.js";
@@ -325,8 +325,16 @@ async function _writeKeypairToFile(kp: Ed25519Keypair): Promise<void> {
  * Idempotent: subsequent calls return the same identity. The migration
  * runs at most once per machine (the old entry is deleted after copy).
  */
-export async function getOrCreateEd25519Keypair(): Promise<Ed25519Keypair> {
+export async function getOrCreateEd25519Keypair(options: { requireKeyring?: boolean } = {}): Promise<Ed25519Keypair> {
   const backend = _getBackend();
+  if (options.requireKeyring) {
+    try {
+      await stat(IDENTITY_FILE);
+      throw new Error("A file identity exists; resolve it before enabling keyring-only hosting");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 
   // ── Path 0: an existing file-backed identity wins ──────────────────────
   // `~/.pi/remote/identity.json` is only ever written by the headless/degraded
@@ -337,7 +345,7 @@ export async function getOrCreateEd25519Keypair(): Promise<Ed25519Keypair> {
   // keyring so a keyring that later comes online can't return a different key,
   // nor mint a fresh one over the file identity. No file → normal keyring
   // resolution below; a headless first run still reaches Path B and mints one.
-  const existingFile = await _readKeypairFromFile();
+  const existingFile = options.requireKeyring ? null : await _readKeypairFromFile();
   if (existingFile) return existingFile;
 
   // ── Path A: keyring (retried) ──────────────────────────────────────────
@@ -367,10 +375,15 @@ export async function getOrCreateEd25519Keypair(): Promise<Ed25519Keypair> {
 
       // Both reads SUCCEEDED and returned nothing → genuine first run on a
       // working keyring. Generate and save to the new service.
+      if (options.requireKeyring) {
+        const paired = await _readPeerContainerStrict();
+        if (paired.length > 0) throw new PairedIdentityMissingError(paired.length, "No keyring identity found");
+      }
       const fresh = generateEd25519Keypair();
       await backend.write(NEW_SERVICE, ACCOUNT, _serialize(fresh));
       return fresh;
     } catch (err) {
+      if (err instanceof PairedIdentityMissingError) throw err;
       keyringError = err;
       if (attempt < _keyringReadAttempts - 1) {
         // Linear backoff — a locked Keychain usually frees within seconds.
@@ -383,6 +396,7 @@ export async function getOrCreateEd25519Keypair(): Promise<Ed25519Keypair> {
   // Path 0 already returned any pre-existing file identity; this defensive
   // re-check catches a file written concurrently by another Pi process during
   // the keyring-retry window (still: use it, never regenerate).
+  if (options.requireKeyring) throw new KeyringUnavailableError(keyringError);
   const fromFile = await _readKeypairFromFile();
   if (fromFile) return fromFile;
 

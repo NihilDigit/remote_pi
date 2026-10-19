@@ -109,6 +109,39 @@ afterEach(() => {
 
 // ── Keyring path ────────────────────────────────────────────────────────────
 
+describe("keyring-only host identity", () => {
+  test("does not mint a new key when paired owners exist but keyring entries are missing", async () => {
+    const backend = new InMemoryBackend();
+    _setKeyStoreBackendForTest(backend);
+    mkdirSync(join(_tmpHome, ".pi", "remote"), { recursive: true });
+    writeFileSync(join(_tmpHome, ".pi", "remote", "peers.json"), JSON.stringify({ peers: [
+      { name: "Synthetic", remote_epk: "synthetic-owner", paired_at: "synthetic" },
+    ] }));
+    await expect(getOrCreateEd25519Keypair({ requireKeyring: true })).rejects.toThrow(storage.PairedIdentityMissingError);
+    expect(backend.writes).toEqual([]);
+  });
+  test("refuses fallback even when file identity is explicitly enabled", async () => {
+    const backend = new InMemoryBackend();
+    backend.failAll("read");
+    _setKeyStoreBackendForTest(backend);
+    _setKeyringExpectedForTest(false);
+    process.env.REMOTE_PI_ALLOW_FILE_IDENTITY = "1";
+    await expect(getOrCreateEd25519Keypair({ requireKeyring: true })).rejects.toThrow(KeyringUnavailableError);
+    expect(existsSync(_IDENTITY_FILE_FOR_TEST)).toBe(false);
+    expect(backend.writes).toEqual([]);
+  });
+
+  test("rejects an existing file identity before querying the keyring", async () => {
+    const backend = new InMemoryBackend();
+    _setKeyStoreBackendForTest(backend);
+    mkdirSync(join(_tmpHome, ".pi", "remote"), { recursive: true });
+    writeFileSync(_IDENTITY_FILE_FOR_TEST, "not-read-or-migrated");
+    await expect(getOrCreateEd25519Keypair({ requireKeyring: true })).rejects.toThrow("file identity exists");
+    expect(backend.reads).toEqual([]);
+    expect(readFileSync(_IDENTITY_FILE_FOR_TEST, "utf8")).toBe("not-read-or-migrated");
+  });
+});
+
 describe("getOrCreateEd25519Keypair — keyring path", () => {
   test("returns existing entry from new service without writing", async () => {
     const backend = new InMemoryBackend();

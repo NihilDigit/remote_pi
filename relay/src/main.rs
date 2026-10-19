@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = relay::build_router(state);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;

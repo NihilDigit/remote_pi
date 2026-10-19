@@ -56,11 +56,13 @@ export function createSessionCatalog(options: {
   running: RunningView;
 }) {
   const projects = new Map<string, CatalogProject>();
+  const directories = new Set<string>();
   for (const project of options.projects) {
-    if (!project.id || !isAbsolute(project.cwd) || projects.has(project.id)) {
+    if (!project.id || !isAbsolute(project.cwd) || projects.has(project.id) || directories.has(project.cwd)) {
       throw new Error("Invalid project allowlist");
     }
     projects.set(project.id, { ...project });
+    directories.add(project.cwd);
   }
   const { sessions, running } = options;
 
